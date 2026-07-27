@@ -1,0 +1,255 @@
+# Pipeline MLOps local: Airflow 3 + MLflow + MinIO + API de inferencia.
+# Basado en el docker-compose oficial de Airflow 3.3.0, simplificado a LocalExecutor
+# (sin Redis ni workers Celery) para que quepa cómodo en un portátil.
+
+x-airflow-comun: &airflow-comun
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: mlops-iris/airflow:latest
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: "${FERNET_KEY}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: 'secreto_jwt_de_clase'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Permite que los DAGs importen src/comun/features.py
+    PYTHONPATH: /opt/airflow/src
+    # Conexión a MLflow y a MinIO desde las tareas
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+    AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+    AWS_DEFAULT_REGION: us-east-1
+    # Parámetros que el DAG lee para lanzar el contenedor de entrenamiento
+    NOMBRE_MODELO: "${NOMBRE_MODELO}"
+    EXPERIMENTO: "${EXPERIMENTO}"
+    RED_DOCKER: "${RED_DOCKER}"
+    IMAGEN_ENTRENADOR: "${IMAGEN_ENTRENADOR}"
+    URL_API: http://api:8000
+    # Airflow NO monta el socket de Docker: habla con el daemon a través del
+    # proxy, que filtra qué endpoints de la API están permitidos.
+    DOCKER_URL: tcp://docker-proxy:2375
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- almacenes
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # consola web
+    volumes:
+      - minio-datos:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # Crea los buckets una sola vez y termina.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb --ignore-existing local/mlflow;
+      mc mb --ignore-existing local/datos;
+      echo 'Buckets listos: mlflow, datos';
+      "
+
+  # ------------------------------------------------------------ acceso a docker
+  # Expone la API de Docker por TCP para que DockerOperator pueda lanzar el
+  # contenedor de entrenamiento.
+  #
+  # ¿Por qué un proxy y no montar /var/run/docker.sock en Airflow? Porque en
+  # macOS ese socket aparece dentro del contenedor como root:root modo 755, y
+  # conectarse a un socket Unix requiere permiso de ESCRITURA. Airflow corre
+  # como UID 501, así que le aplican los permisos de grupo (r-x) y falla con
+  # 'Permission denied'. La alternativa sería correr Airflow como root; con el
+  # proxy no hace falta, y además solo se permiten los endpoints necesarios.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      CONTAINERS: 1   # crear, inspeccionar y borrar contenedores
+      IMAGES: 1       # consultar la imagen del entrenador
+      NETWORKS: 1     # conectarlo a mlops_red
+      INFO: 1
+      POST: 1         # sin esto todo sería solo de lectura
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+
+  # ---------------------------------------------------------------- tracking
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    image: mlops-iris/mlflow:latest
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres/mlflow
+      --artifacts-destination s3://mlflow
+      --serve-artifacts
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "5001:5000"   # 5001 en el host: macOS ocupa el 5000 con AirPlay
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      retries: 10
+      start_period: 20s
+    restart: always
+
+  # ---------------------------------------------------------------- inferencia
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    image: mlops-iris/api:latest
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+      AWS_DEFAULT_REGION: us-east-1
+      NOMBRE_MODELO: "${NOMBRE_MODELO}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    restart: always
+
+  # ---------------------------------------------------------------- airflow
+  # Corre como root para poder ajustar permisos de los volúmenes montados.
+  # La migración de la base de datos y la creación del usuario NO se invocan a
+  # mano: las dispara el /entrypoint de la imagen al ver _AIRFLOW_DB_MIGRATE y
+  # _AIRFLOW_WWW_USER_CREATE. Llamar a `airflow db migrate` directamente aquí
+  # falla, porque root no tiene en su sys.path el /home/airflow/.local donde
+  # está instalado Airflow.
+  airflow-init:
+    <<: *airflow-comun
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/config /opt/airflow/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/config /opt/airflow/plugins
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: "${_AIRFLOW_WWW_USER_USERNAME}"
+      _AIRFLOW_WWW_USER_PASSWORD: "${_AIRFLOW_WWW_USER_PASSWORD}"
+    user: "0:0"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-comun
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  # Con LocalExecutor las tareas corren aquí dentro; por eso este contenedor
+  # es el que necesita alcanzar al docker-proxy para lanzar el entrenador.
+  airflow-scheduler:
+    <<: *airflow-comun
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+      docker-proxy:
+        condition: service_started
+    restart: always
+
+  airflow-dag-processor:
+    <<: *airflow-comun
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+volumes:
+  postgres-datos:
+  minio-datos:
+
+# Nombre fijo de la red: el DAG se lo pasa a DockerOperator para que el
+# contenedor de entrenamiento resuelva 'mlflow' y 'minio' por nombre.
+networks:
+  default:
+    name: mlops_red

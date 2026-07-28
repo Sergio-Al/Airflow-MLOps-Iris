@@ -1,0 +1,3 @@
+# Los scripts se ejecutan dentro de contenedores Linux: fuerza LF siempre,
+# aunque se clonen en Windows. Un CRLF en el shebang rompe la ejecución.
+*.sh text eol=lf

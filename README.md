@@ -88,7 +88,7 @@ correr Airflow como root; con el proxy no hace falta.
 ## 4. Cómo levantarlo
 
 ```bash
-cd "Mod14/Semana 4"
+cd "[carpeta MLOps git]"
 cp .env.example .env          # el .env real no se versiona
 chmod +x scripts/levantar.sh
 ./scripts/levantar.sh

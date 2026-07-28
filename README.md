@@ -1,6 +1,6 @@
 # Pipeline MLOps con Apache Airflow — Dataset Iris
 
-Ejercicio del Módulo 14, Semana 4. Pipeline de datos y entrenamiento de un modelo
+Pipeline de datos y entrenamiento de un modelo
 de ML orquestado con Airflow, todo en local sobre Docker.
 
 **Herramientas:** Airflow 3.3 · PyCaret + XGBoost · MLflow (tracking + registry) ·
